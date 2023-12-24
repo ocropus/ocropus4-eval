@@ -1,4 +1,4 @@
-import glob, os, re, sqlite3, warnings
+import os, re, sqlite3, time
 from itertools import islice
 
 import Levenshtein as lev
@@ -12,6 +12,19 @@ from joblib import Parallel, delayed
 from webdataset.pytorch import IterableDataset
 
 app = typer.Typer()
+
+
+def enumerate_report(source, interval=5, growth=1.3):
+    last = 0
+    count = 0
+    for item in source:
+        if time.time() - last > interval:
+            last = time.time()
+            interval *= growth
+            yield count, item, True
+        else:
+            yield count, item, False
+        count += 1
 
 
 def compute_image_frame(hocr):
@@ -34,106 +47,6 @@ def compute_image_frame(hocr):
             [boxes[:, 2].max(), boxes[:, 3].max()],
         ]
     )
-
-
-@app.command()
-def reframe(
-    source,
-    output: str = None,
-    hocr: str = "hocr.html",
-    img: str = "page.jpg",
-    margin: int = 10,
-    maxcount: int = 999999,
-):
-    ds = wds.WebDataset(source).decode("rgb")
-    output = wds.TarWriter(output)
-    for sample in islice(ds, maxcount):
-        if hocr not in sample:
-            warnings.warn(f"missing {hocr} in {sample['__key__']}, got {sample.keys()}")
-            continue
-        frame = compute_image_frame(sample[hocr])
-        if frame is None:
-            continue
-        (x0, y0), (x1, y1) = frame
-        print(sample["__key__"], x0, y0, x1, y1)
-        h, w = sample[img].shape[:2]
-        result_image = np.zeros_like(sample[img])
-        result_image[:, :, ...] = np.amax(sample[img])
-        y0, x0, y1, x1 = (
-            int(max(y0 - margin, 0)),
-            int(max(x0 - margin, 0)),
-            int(min(y1 + margin, h)),
-            int(min(x1 + margin, w)),
-        )
-        result_image[y0:y1, x0:x1] = sample[img][y0:y1, x0:x1]
-        sample[img] = result_image
-        output.write(sample)
-    output.close()
-
-
-def runocr1(
-    sample,
-    img_key="page.jpg",
-    output_key="tess.html",
-    cmd: str = "tesseract page.jpg output hocr",
-):
-    """Run OCR on a single image."""
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as dirname:
-        image = sample[img_key]
-        with open(os.path.join(dirname, "page.jpg"), "wb") as stream:
-            stream.write(image)
-        thecommand = f"cd {dirname} && " + cmd.format(
-            input="page.jpg", output_base="out"
-        )
-        print("#", thecommand)
-        assert os.system(thecommand) == 0, thecommand
-        outputs = glob.glob(os.path.join(dirname, "output.*"))
-        assert len(outputs) == 1, outputs
-        with open(os.path.join(dirname, outputs[0])) as stream:
-            sample[output_key] = stream.read()
-    return sample
-
-
-@app.command()
-def runocr(
-    source,
-    output: str = None,
-    img: str = "page.jpg",
-    output_key: str = "tess.html",
-    cmd: str = "tesseract page.jpg output hocr",
-    maxcount: int = 999999,
-):
-    """Run OCR over a webdataset."""
-    ds = wds.WebDataset(source)
-    output = wds.TarWriter(output)
-    for sample in islice(ds, maxcount):
-        sample = runocr1(sample)
-        print(sample["__key__"], repr(sample[output_key])[-100:])
-        output.write(sample)
-    output.close()
-
-
-@app.command()
-def parocr(
-    source,
-    output: str = None,
-    img_key: str = "page.jpg",
-    output_key: str = "tess.html",
-    cmd: str = "tess page.jpg output.html hocr",
-    njobs=4,
-    maxcount: int = 999999,
-):
-    """Run OCR on a webdataset in parallel using joblib."""
-    ds = wds.WebDataset(source).decode("rgb")
-    output = wds.TarWriter(output)
-    f = partial(runocr1, cmd=cmd)
-    results = Parallel(n_jobs=njobs, batch_size=njobs)(
-        delayed(f)(sample) for sample in islice(ds, maxcount)
-    )
-    for result in results:
-        output.write({"hocr": result})
 
 
 def strip_hocr(html_doc):
@@ -282,7 +195,13 @@ def ocr_eval(gt, ocr, r=20, threshold=10, intermediate=False):
 
 
 @app.command()
-def loadgt(urls: str, output: str="", key: str = "hocr.html", strip: bool = False, append:bool=False):
+def loadgt(
+    urls: str,
+    output: str = "",
+    key: str = "hocr.html",
+    strip: bool = False,
+    append: bool = False,
+):
     """Extract ground truth from webdataset and store in sqlite database.
 
     This command extracts the ground truth from a webdataset and stores it
@@ -301,18 +220,16 @@ def loadgt(urls: str, output: str="", key: str = "hocr.html", strip: bool = Fals
     db.execute(
         "CREATE TABLE IF NOT EXISTS ground_truth (key TEXT PRIMARY KEY, gt TEXT)"
     )
-    count = 0
     ds = wds.WebDataset(urls, resampled=False).decode()
-    for sample in ds:
+    for count, sample, report in enumerate_report(ds):
         key = sample["__key__"]
         assert gt_ext in sample, f"missing {gt_ext} in {key}, have: {sample.keys()}"
         text = sample[gt_ext]
         if strip:
             text = strip_hocr(text)
         db.execute("INSERT OR REPLACE INTO ground_truth VALUES (?, ?)", (key, text))
-        if count % 1000 == 0:
+        if report:
             print(count, key)
-        count += 1
     db.commit()
     db.close()
 
@@ -328,9 +245,12 @@ class AugmentedDataset(IterableDataset):
     def __iter__(self):
         for sample in self.dataset:
             key = sample["__key__"]
-            text = self.augment.execute("SELECT gt FROM ground_truth WHERE key=?", (key,)).fetchone()[0]
+            text = self.augment.execute(
+                "SELECT gt FROM ground_truth WHERE key=?", (key,)
+            ).fetchone()[0]
             sample[self.key] = text
             yield sample
+
 
 class ZippedDataset(IterableDataset):
     """Zip two webdatasets together."""
@@ -342,7 +262,9 @@ class ZippedDataset(IterableDataset):
 
     def __iter__(self):
         for sample, sample2 in zip(self.dataset, self.dataset2):
-            assert sample["__key__"] == sample2["__key__"], f"incompatible shards: {sample['__key__']} != {sample2['__key__']}"  
+            assert (
+                sample["__key__"] == sample2["__key__"]
+            ), f"incompatible shards: {sample['__key__']} != {sample2['__key__']}"
             if self.keys:
                 sample.update({k: sample2[k] for k in self.keys})
             else:
@@ -391,15 +313,15 @@ def texteval(
         assert not os.path.exists(output), f"{output} already exists"
     odb = sqlite3.connect(output)
     odb.execute(
-        "CREATE TABLE IF NOT EXISTS ocr_eval " +
-        "(key TEXT PRIMARY KEY, gt TEXT, gtsize INTEGER, result TEXT, resultsize INTEGER, err REAL, rerr REAL, layout_err INTEGER)"
+        "CREATE TABLE IF NOT EXISTS ocr_eval "
+        + "(key TEXT PRIMARY KEY, gt TEXT, gtsize INTEGER, result TEXT, resultsize INTEGER, err REAL, rerr REAL, layout_err INTEGER)"
     )
     ds = wds.WebDataset(urls).decode()
     if gtdb:
         ds = AugmentedDataset(ds, sqlite3.connect(gtdb), key=gtkey)
     elif gtshards:
         ds = ZippedDataset(ds, wds.WebDataset(gtshards).decode(), keys=[gtkey])
-    for i, sample in enumerate(islice(ds, maxcount)):
+    for i, sample, report in enumerate_report(islice(ds, maxcount)):
         key = sample["__key__"]
         gt = sample[gtkey]
         ocr = sample[ocrkey]
@@ -407,7 +329,8 @@ def texteval(
             gt = strip_hocr(gt)
             ocr = strip_hocr(ocr)
         errs, rerrs, layout = ocr_eval(gt, ocr, r=r, threshold=threshold)
-        print(i, key, errs, rerrs, layout)
+        if report:
+            print(i, key, errs, rerrs, layout)
         odb.execute(
             """
             INSERT OR REPLACE INTO ocr_eval 
@@ -446,24 +369,28 @@ def extract_bounding_boxes_and_text(hocr, element="ocrx_word"):
             texts.append(span.text)
     return np.array(boxes), texts
 
+
 def compute_overlap(gt_box, ocr_box):
     # gt_box and ocr_box are (x0,y0,x1,y1) arrays
     # compute the overlap of the two boxes as area of intersection over minimum area of the two boxes
     # return 0 if there is no overlap
     # return 1 if the boxes are identical
-    gt_area = (gt_box[2]-gt_box[0])*(gt_box[3]-gt_box[1])
-    ocr_area = (ocr_box[2]-ocr_box[0])*(ocr_box[3]-ocr_box[1])
-    intersection_area = max(0, min(gt_box[2], ocr_box[2]) - max(gt_box[0], ocr_box[0])) * max(0, min(gt_box[3], ocr_box[3]) - max(gt_box[1], ocr_box[1]))
+    gt_area = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
+    ocr_area = (ocr_box[2] - ocr_box[0]) * (ocr_box[3] - ocr_box[1])
+    intersection_area = max(
+        0, min(gt_box[2], ocr_box[2]) - max(gt_box[0], ocr_box[0])
+    ) * max(0, min(gt_box[3], ocr_box[3]) - max(gt_box[1], ocr_box[1]))
     if intersection_area == 0:
         return 0
     else:
         return intersection_area / min(gt_area, ocr_area)
 
+
 def compute_overlap_matrix(gt_boxes, ocr_boxes):
     overlaps = np.zeros((len(gt_boxes), len(ocr_boxes)))
-    for i,gt in enumerate(gt_boxes):
-        for j,ocr in enumerate(ocr_boxes):
-            overlaps[i,j] = compute_overlap(gt, ocr)
+    for i, gt in enumerate(gt_boxes):
+        for j, ocr in enumerate(ocr_boxes):
+            overlaps[i, j] = compute_overlap(gt, ocr)
     return overlaps
 
 
@@ -508,15 +435,15 @@ def bboxeval(
         assert not os.path.exists(output), f"{output} already exists"
     odb = sqlite3.connect(output)
     odb.execute(
-        "CREATE TABLE IF NOT EXISTS bb_eval " +
-        "(key TEXT PRIMARY KEY, gt TEXT, result TEXT, errors INT, total INT, missing_ocr INT, extra_ocr INT)"
+        "CREATE TABLE IF NOT EXISTS bb_eval "
+        + "(key TEXT PRIMARY KEY, gt TEXT, result TEXT, errors INT, total INT, missing_ocr INT, extra_ocr INT)"
     )
     ds = wds.WebDataset(urls).decode()
     if gtdb:
         ds = AugmentedDataset(ds, sqlite3.connect(gtdb), key=gtkey)
     elif gtshards:
         ds = ZippedDataset(ds, wds.WebDataset(gtshards).decode(), keys=[gtkey])
-    for i, sample in enumerate(islice(ds, maxcount)):
+    for i, sample, report in enumerate_report(islice(ds, maxcount)):
         key = sample["__key__"]
         gt = sample[gtkey]
         ocr = sample[ocrkey]
@@ -525,8 +452,11 @@ def bboxeval(
         if len(gt_boxes) == 0 or len(ocr_boxes) == 0:
             print(i, key, "no boxes")
             continue
-        errors, total, missing_ocr, extra_ocr = compute_match(gt_boxes, ocr_boxes, gt_text, ocr_text, verbose=verbose)
-        print(i, key, errors, total, missing_ocr, extra_ocr)
+        errors, total, missing_ocr, extra_ocr = compute_match(
+            gt_boxes, ocr_boxes, gt_text, ocr_text, verbose=verbose
+        )
+        if report:
+            print(i, key, errors, total, missing_ocr, extra_ocr)
         odb.execute(
             """
             INSERT OR REPLACE INTO bb_eval 
@@ -545,7 +475,6 @@ def bboxeval(
         )
         odb.commit()
     odb.close()
-
 
 
 def main():

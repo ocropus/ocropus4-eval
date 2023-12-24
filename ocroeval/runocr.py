@@ -1,4 +1,4 @@
-import glob, os, re
+import glob, os, re, subprocess, time, warnings
 from itertools import islice
 
 import numpy as np
@@ -6,9 +6,21 @@ import typer
 import webdataset as wds
 from bs4 import BeautifulSoup
 from joblib import Parallel, delayed
-import warnings
 
 app = typer.Typer()
+
+
+def enumerate_report(source, interval=5, growth=1.3):
+    last = 0
+    count = 0
+    for item in source:
+        if time.time() - last > interval:
+            last = time.time()
+            interval *= growth
+            yield count, item, True
+        else:
+            yield count, item, False
+        count += 1
 
 
 def compute_image_frame(hocr):
@@ -51,7 +63,7 @@ def reframe(
     """
     ds = wds.WebDataset(source).decode("rgb")
     output = wds.TarWriter(output)
-    for sample in islice(ds, maxcount):
+    for count, sample, report in enumerate_report(islice(ds, maxcount)):
         if hocr not in sample:
             warnings.warn(f"missing {hocr} in {sample['__key__']}, got {sample.keys()}")
             continue
@@ -59,7 +71,8 @@ def reframe(
         if frame is None:
             continue
         (x0, y0), (x1, y1) = frame
-        print(sample["__key__"], x0, y0, x1, y1)
+        if report:
+            print(count, sample["__key__"], x0, y0, x1, y1)
         h, w = sample[img].shape[:2]
         result_image = np.zeros_like(sample[img])
         result_image[:, :, ...] = np.amax(sample[img])
@@ -73,6 +86,19 @@ def reframe(
         sample[img] = result_image
         output.write(sample)
     output.close()
+
+
+def run_command(thecommand):
+    process = subprocess.run(
+        thecommand,
+        shell=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = process.stdout.decode("utf-8")
+    stderr = process.stderr.decode("utf-8")
+    return stdout, stderr
 
 
 def runocr1(
@@ -91,8 +117,13 @@ def runocr1(
         thecommand = f"cd {dirname} && " + cmd.format(
             input="page.jpg", output_base="out"
         )
-        print("#", thecommand)
-        assert os.system(thecommand) == 0, thecommand
+        try:
+            run_command(thecommand)
+        except subprocess.CalledProcessError as e:
+            print(e)
+            print(e.stdout)
+            print(e.stderr)
+            raise
         outputs = glob.glob(os.path.join(dirname, "output.*"))
         assert len(outputs) == 1, outputs
         with open(os.path.join(dirname, outputs[0])) as stream:
@@ -112,9 +143,10 @@ def runocr(
     """Run OCR over a webdataset."""
     ds = wds.WebDataset(source)
     output = wds.TarWriter(output)
-    for sample in islice(ds, maxcount):
+    for count, sample, report in enumerate_report(islice(ds, maxcount)):
         sample = runocr1(sample)
-        print(sample["__key__"], repr(sample[output_key])[-100:])
+        if report:
+            print(count, sample["__key__"], repr(sample[output_key])[-100:])
         output.write(sample)
     output.close()
 
