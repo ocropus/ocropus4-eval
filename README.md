@@ -294,8 +294,3 @@ plt.ylabel("character error rate (bounding boxes)");
 ![png](README_files/README_23_0.png)
     
 
-
-
-```python
-
-```
