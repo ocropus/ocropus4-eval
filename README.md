@@ -22,6 +22,14 @@ Two evaluations are possible:
 
 Both evaluation methods use heuristics to arrive at error estimates. Nevertheless, they should be good enough to assess the relative performance of different OCR engines.
 
+# Installation
+
+There is a small `Makefile`:
+
+- `make venv` -- install/update the virtual environment
+- `make README.md` -- update the README from the notebook
+- `make install` -- install in $HOME or globally
+
 # Evaluation Dataset
 
 We start with a small evaluation dataset of 100 pages stored in a tar archive (with WebDataset conventions).
@@ -66,7 +74,7 @@ plt.imshow(raw[66][".page.jpg"], cmap="gray")
 
 
     
-![png](README_files/README_5_2.png)
+![png](README_files/README_6_2.png)
     
 
 
@@ -100,7 +108,7 @@ plt.imshow(reframed[66][".page.jpg"], cmap="gray")
 
 
     
-![png](README_files/README_8_2.png)
+![png](README_files/README_9_2.png)
     
 
 
@@ -213,7 +221,7 @@ df.layout_err.hist(bins=10);
 
 
     
-![png](README_files/README_16_0.png)
+![png](README_files/README_17_0.png)
     
 
 
@@ -264,7 +272,7 @@ plt.legend();
 
 
     
-![png](README_files/README_20_0.png)
+![png](README_files/README_21_0.png)
     
 
 
@@ -283,7 +291,7 @@ plt.ylabel("character error rate (bounding boxes)");
 
 
     
-![png](README_files/README_22_0.png)
+![png](README_files/README_23_0.png)
     
 
 
